@@ -1,0 +1,26 @@
+Looking in indexes: https://mirrors.aliyun.com/pypi/simple/
+Collecting causal-conv1d
+  Using cached https://mirrors.aliyun.com/pypi/packages/64/cb/104778c728dc3d5ea3bf65a484e3a4cdbe894bdaa2586320e2f61d007b8c/causal_conv1d-1.5.3.post1.tar.gz (24 kB)
+  Preparing metadata (pyproject.toml): started
+  Preparing metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: torch in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from causal-conv1d) (2.1.0+cu118)
+Requirement already satisfied: packaging in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from causal-conv1d) (25.0)
+Requirement already satisfied: ninja in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from causal-conv1d) (1.13.0)
+Requirement already satisfied: filelock in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (3.19.1)
+Requirement already satisfied: typing-extensions in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (4.15.0)
+Requirement already satisfied: sympy in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (1.14.0)
+Requirement already satisfied: networkx in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (3.3)
+Requirement already satisfied: jinja2 in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (3.1.6)
+Requirement already satisfied: fsspec in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (2025.9.0)
+Requirement already satisfied: triton==2.1.0 in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from torch->causal-conv1d) (2.1.0)
+Requirement already satisfied: MarkupSafe>=2.0 in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from jinja2->torch->causal-conv1d) (2.1.5)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /home/stat-jijianxin/anaconda3/envs/mamba2/lib/python3.10/site-packages (from sympy->torch->causal-conv1d) (1.3.0)
+Building wheels for collected packages: causal-conv1d
+  Building wheel for causal-conv1d (pyproject.toml): started
+  Building wheel for causal-conv1d (pyproject.toml): still running...
+  Building wheel for causal-conv1d (pyproject.toml): finished with status 'done'
+  Created wheel for causal-conv1d: filename=causal_conv1d-1.5.3.post1-cp310-cp310-linux_x86_64.whl size=99795856 sha256=4b4644553ea24ed576953291e4316d719180cc2fedfd9256cfa0ceea9de5f0c1
+  Stored in directory: /home/stat-jijianxin/.cache/pip/wheels/cf/4f/ce/9cd2856f3e5dff5a4464a5900dc29470100dd65e247e81d5db
+Successfully built causal-conv1d
+Installing collected packages: causal-conv1d
+Successfully installed causal-conv1d-1.5.3.post1
