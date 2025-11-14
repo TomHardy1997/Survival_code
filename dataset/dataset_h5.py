@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import os
 import pandas as pd
 import numpy as np
@@ -354,6 +354,7 @@ class PrognosisDataset(Dataset):
         print("="*60)
         
         return external_test
+    
     def save_split(self, filename):
         """保存当前的数据分割"""
         split_data = {
@@ -547,8 +548,114 @@ class PrognosisSplit(Dataset):
         return np.random.choice(available_ids, size=n_samples, replace=replace)
 
 
+# ============= 自定义Collate函数 =============
+def custom_collate_fn(batch):
+    """
+    自定义collate函数,用于处理变长的patch序列
+    
+    Args:
+        batch: list of dict, 每个dict包含:
+            - case_id: 患者ID
+            - gender: 性别
+            - age: 年龄
+            - label: 标签
+            - survival_time: 生存时间
+            - censorship: 删失状态
+            - features: [num_patches, feature_dim]
+            - coords: [num_patches, 2]
+            - num_patches: patch数量
+    
+    Returns:
+        tuple: (patient_list, gender_tensor, age_tensor, label_tensor, 
+                sur_time_tensor, censor_tensor, path_features, coords_tensor, 
+                num_patch_tensor, mask_tensor)
+    """
+    # 过滤掉None
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        return None
+    
+    # 提取数据
+    patient_list = [item['case_id'] for item in batch]
+    gender_list = [item['gender'] for item in batch]
+    age_list = [item['age'] for item in batch]
+    label_list = [item['label'] for item in batch]
+    sur_time_list = [item['survival_time'] for item in batch]
+    censor_list = [item['censorship'] for item in batch]
+    
+    # 找到最大patch数
+    max_patch_count = max(item['num_patches'] for item in batch)
+    
+    path_features_list = []
+    coords_list = []
+    mask_list = []
+    num_patch_list = []
+    
+    for item in batch:
+        features = item['features']  # [num_patches, feature_dim]
+        coords = item['coords']      # [num_patches, 2]
+        num_patches = item['num_patches']
+        
+        # Padding features
+        if features.size(0) < max_patch_count:
+            padding = torch.zeros(
+                max_patch_count - features.size(0), 
+                features.size(1),
+                dtype=features.dtype
+            )
+            features = torch.cat((features, padding), dim=0)
+        
+        # Padding coords
+        if coords.size(0) < max_patch_count:
+            coords_padding = torch.zeros(
+                max_patch_count - coords.size(0), 
+                coords.size(1),
+                dtype=coords.dtype
+            )
+            coords = torch.cat((coords, coords_padding), dim=0)
+        
+        # 创建mask (1表示真实patch, 0表示padding)
+        mask = torch.ones(max_patch_count, dtype=torch.float)
+        mask[num_patches:] = 0
+        
+        path_features_list.append(features)
+        coords_list.append(coords)
+        mask_list.append(mask)
+        num_patch_list.append(num_patches)
+    
+    # 转换为tensor
+    gender_tensor = torch.tensor(gender_list, dtype=torch.long)
+    age_tensor = torch.tensor(age_list, dtype=torch.float)
+    label_tensor = torch.tensor(label_list, dtype=torch.long)
+    sur_time_tensor = torch.tensor(sur_time_list, dtype=torch.float)
+    censor_tensor = torch.tensor(censor_list, dtype=torch.float)
+    
+    # Stack成batch
+    path_features = torch.stack(path_features_list, dim=0)  # [batch, max_patches, feat_dim]
+    coords_tensor = torch.stack(coords_list, dim=0)         # [batch, max_patches, 2]
+    mask_tensor = torch.stack(mask_list, dim=0)             # [batch, max_patches]
+    num_patch_tensor = torch.tensor(num_patch_list, dtype=torch.long)  # [batch]
+    
+    return (
+        patient_list,      # list of str
+        gender_tensor,     # [batch]
+        age_tensor,        # [batch]
+        label_tensor,      # [batch]
+        sur_time_tensor,   # [batch]
+        censor_tensor,     # [batch]
+        path_features,     # [batch, max_patches, feat_dim]
+        coords_tensor,     # [batch, max_patches, 2]
+        num_patch_tensor,  # [batch]
+        mask_tensor        # [batch, max_patches]
+    )
+
+
 # ============= 使用示例 =============
 if __name__ == '__main__':
+    print("="*60)
+    print("Testing PrognosisDataset")
+    print("="*60)
+    
     # 1. 创建数据集
     dataset = PrognosisDataset(
         csv_path='/home/stat-jijianxin/PFMs/Survival_code/csv_file/tcga_survival_matched.csv',
@@ -556,7 +663,7 @@ if __name__ == '__main__':
         use_cache=True,
         print_info=True
     )
-    import ipdb;ipdb.set_trace()
+    
     # 2. 创建5-fold交叉验证
     dataset.create_splits(n_splits=5, val_ratio=0.15, test_ratio=0.15)
     
@@ -572,21 +679,71 @@ if __name__ == '__main__':
     print(f"Val dataset: {len(val_dataset)} patients")
     print(f"Test dataset: {len(test_dataset)} patients")
     
-    # 5. 测试加载数据
+    # 5. 测试加载单个样本
+    print("\n" + "="*60)
+    print("Testing single sample loading")
+    print("="*60)
     sample = train_dataset[0]
-    print(f"\nFirst training sample:")
-    print(f"  Patient: {sample['case_id']}")
-    print(f"  Gender: {sample['gender']}, Age: {sample['age']}")
-    print(f"  Label: {sample['label']}, Survival: {sample['survival_time']} months, Censored: {sample['censorship']}")
-    print(f"  Features shape: {sample['features'].shape}")
-    print(f"  Coords shape: {sample['coords'].shape}")
-    print(f"  Num patches: {sample['num_patches']}")
+    print(f"Patient: {sample['case_id']}")
+    print(f"Gender: {sample['gender']}, Age: {sample['age']}")
+    print(f"Label: {sample['label']}, Survival: {sample['survival_time']} months, Censored: {sample['censorship']}")
+    print(f"Features shape: {sample['features'].shape}")
+    print(f"Coords shape: {sample['coords'].shape}")
+    print(f"Num patches: {sample['num_patches']}")
     
-    # 6. 类别平衡采样示例
-    print("\n类别平衡采样:")
+    # 6. 测试DataLoader + custom_collate_fn
+    print("\n" + "="*60)
+    print("Testing DataLoader with custom_collate_fn")
+    print("="*60)
+    
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=4,
+        shuffle=True,
+        num_workers=0,  # 测试时用0,实际训练可以增加
+        collate_fn=custom_collate_fn,
+        pin_memory=False
+    )
+    import ipdb;ipdb.set_trace()
+    # 加载一个batch测试
+    for batch_idx, batch_data in enumerate(train_loader):
+        if batch_data is None:
+            print("Warning: Got None batch")
+            continue
+            
+        (patient_list, gender, age, label, sur_time, censor, 
+         features, coords, num_patches, mask) = batch_data
+        
+        print(f"\nBatch {batch_idx}:")
+        print(f"  Batch size: {len(patient_list)}")
+        print(f"  Patient IDs: {patient_list}")
+        print(f"  Features shape: {features.shape}")      # [batch, max_patches, feat_dim]
+        print(f"  Coords shape: {coords.shape}")          # [batch, max_patches, 2]
+        print(f"  Mask shape: {mask.shape}")              # [batch, max_patches]
+        print(f"  Num patches: {num_patches.tolist()}")   # [batch]
+        print(f"  Labels: {label.tolist()}")              # [batch]
+        print(f"  Survival times: {sur_time.tolist()}")   # [batch]
+        print(f"  Censorship: {censor.tolist()}")         # [batch]
+        print(f"  Gender: {gender.tolist()}")             # [batch]
+        print(f"  Age: {age.tolist()}")                   # [batch]
+        
+        # 只测试第一个batch
+        break
+    
+    # 7. 类别平衡采样测试
+    print("\n" + "="*60)
+    print("Testing class-balanced sampling")
+    print("="*60)
     for cls in range(dataset.num_classes):
         samples = train_dataset.get_class_samples(cls, n_samples=5)
-        print(f"  Class {cls}: sampled {len(samples)} patients")
+        print(f"Class {cls}: sampled {len(samples)} patients")
     
-    # 7. 保存和加载split
+    # 8. 保存split
+    print("\n" + "="*60)
+    print("Saving split")
+    print("="*60)
     dataset.save_split('split_fold0.csv')
+    
+    print("\n" + "="*60)
+    print("All tests passed! ✅")
+    print("="*60)
