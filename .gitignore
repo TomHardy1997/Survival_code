@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints
+logs/
+results*/
+h5_check_results/
+*.log
+.DS_Store
+MambaMIL-main/
+slide_distribution.png
