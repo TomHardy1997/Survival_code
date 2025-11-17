@@ -44,6 +44,8 @@ def main():
                        help='Mamba层数')
     
     # ========== 训练参数 ==========
+    parser.add_argument('--batch_size', type=int, default=1,
+                       help='批大小 (MIL任务通常使用1)')
     parser.add_argument('--max_epochs', type=int, default=100,
                        help='最大训练轮数')
     parser.add_argument('--lr', type=float, default=2e-4,
@@ -54,10 +56,16 @@ def main():
                        choices=['adam', 'adamw'],
                        help='优化器')
     parser.add_argument('--loss', type=str, default='nll',
-                       choices=['cox', 'nll'],
+                       choices=['cox', 'nll', 'combined'],
                        help='损失函数类型')
     parser.add_argument('--alpha_surv', type=float, default=0.0,
                        help='NLL损失的alpha参数')
+    
+    # ========== Ranking Loss参数 ==========
+    parser.add_argument('--ranking_weight', type=float, default=0.1,
+                       help='Ranking loss权重 (仅当loss=combined时使用)')
+    parser.add_argument('--ranking_margin', type=float, default=0.0,
+                       help='Ranking loss边界值 (仅当loss=combined时使用)')
     parser.add_argument('--gc', type=int, default=1,
                        help='梯度累积步数')
     
@@ -87,7 +95,7 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                        help='随机种子')
     
-    # ========== 解析参数 (必须在这里!) ==========
+    # ========== 解析参数 ==========
     args = parser.parse_args()
     
     # ========== 验证外部测试集参数 ==========
@@ -96,11 +104,20 @@ def main():
     if args.external_h5_dir and not args.external_csv_path:
         parser.error('--external_csv_path is required when --external_h5_dir is provided')
     
+    # ========== 验证损失函数参数 ==========
+    if args.loss == 'combined':
+        if args.ranking_weight <= 0:
+            print(f'⚠️  Warning: loss=combined but ranking_weight={args.ranking_weight}, setting to 0.1')
+            args.ranking_weight = 0.1
+    
     # 设置随机种子
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     
     # 创建结果目录
     os.makedirs(args.results_dir, exist_ok=True)
@@ -113,7 +130,9 @@ def main():
         f.write('='*60 + '\n')
         for key, value in sorted(vars(args).items()):
             f.write(f'{key}: {value}\n')
+        f.write('='*60 + '\n')
     
+    # 打印配置
     print('\n' + '='*60)
     print('Training Configuration')
     print('='*60)
@@ -121,15 +140,64 @@ def main():
         print(f'{key}: {value}')
     print('='*60 + '\n')
     
+    # 打印设备信息
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Device: {device}')
+    if torch.cuda.is_available():
+        print(f'GPU: {torch.cuda.get_device_name(0)}')
+        print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB')
+    print()
+    
     # 开始训练
-    if args.fold is not None:
-        # 训练单个fold
-        print(f'\n训练单个 Fold {args.fold}...\n')
-        results = train_survival(args)
-    else:
-        # K-Fold交叉验证
-        print(f'\n开始 {args.k_fold}-Fold 交叉验证...\n')
-        summary = train_k_fold(args)
+    try:
+        if args.fold is not None:
+            # 训练单个fold
+            print(f'\n{"="*60}')
+            print(f'训练单个 Fold {args.fold}')
+            print(f'{"="*60}\n')
+            results = train_survival(args)
+            
+            # 打印结果
+            print(f'\n{"="*60}')
+            print(f'Fold {args.fold} 训练完成!')
+            print(f'{"="*60}')
+            if results:
+                print(f"\n最佳验证 C-Index: {results.get('best_val_cindex', 0):.4f}")
+                print(f"测试 C-Index: {results.get('test_cindex', 0):.4f}")
+                if results.get('external_cindex') is not None:
+                    print(f"外部测试 C-Index: {results['external_cindex']:.4f}")
+            print()
+            
+        else:
+            # K-Fold交叉验证
+            print(f'\n{"="*60}')
+            print(f'开始 {args.k_fold}-Fold 交叉验证')
+            print(f'{"="*60}\n')
+            summary = train_k_fold(args)
+            
+            # 打印汇总结果
+            print(f'\n{"="*60}')
+            print(f'{args.k_fold}-Fold 交叉验证完成!')
+            print(f'{"="*60}')
+            if summary:
+                print(f"\n平均验证 C-Index: {summary.get('mean_val_cindex', 0):.4f} ± {summary.get('std_val_cindex', 0):.4f}")
+                print(f"平均测试 C-Index: {summary.get('mean_test_cindex', 0):.4f} ± {summary.get('std_test_cindex', 0):.4f}")
+                if summary.get('mean_external_cindex') is not None:
+                    print(f"平均外部测试 C-Index: {summary['mean_external_cindex']:.4f} ± {summary['std_external_cindex']:.4f}")
+            print()
+            
+    except KeyboardInterrupt:
+        print('\n\n训练被用户中断!')
+        sys.exit(0)
+    except Exception as e:
+        print(f'\n\n训练过程中发生错误: {str(e)}')
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    print('='*60)
+    print('训练完成!')
+    print('='*60)
 
 
 if __name__ == '__main__':

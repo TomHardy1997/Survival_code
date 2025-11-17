@@ -228,42 +228,93 @@ class RankingLoss(nn.Module):
             loss = loss / count
         
         return loss
-
+class CombinedSurvLoss(nn.Module):
+    """
+    组合生存损失 = 主损失(NLL/Cox) + λ * Ranking Loss
+    
+    Args:
+        main_loss_type: str, 主损失类型 ('nll' or 'cox')
+        alpha: float, NLL损失的alpha参数 (仅当main_loss_type='nll'时使用)
+        ranking_weight: float, ranking loss的权重系数 λ
+        ranking_margin: float, ranking loss的边界值
+    """
+    def __init__(
+        self, 
+        main_loss_type: str = 'nll',
+        alpha: float = 0.0,
+        ranking_weight: float = 0.1,
+        ranking_margin: float = 0.0
+    ):
+        super(CombinedSurvLoss, self).__init__()
+        
+        # 主损失
+        if main_loss_type.lower() == 'nll':
+            self.main_loss = NLLSurvLoss(alpha=alpha)
+        elif main_loss_type.lower() == 'cox':
+            self.main_loss = CoxSurvLoss()
+        else:
+            raise ValueError(f"Unknown main_loss_type: {main_loss_type}")
+        
+        # Ranking损失
+        self.ranking_loss = RankingLoss(margin=ranking_margin)
+        self.ranking_weight = ranking_weight
+        self.main_loss_type = main_loss_type.lower()
+    
+    def forward(
+        self,
+        hazards: torch.Tensor,
+        S: torch.Tensor,
+        Y: torch.Tensor,
+        c: torch.Tensor,
+        **kwargs
+    ) -> torch.Tensor:
+        # 计算主损失
+        main_loss_value = self.main_loss(hazards, S, Y, c, **kwargs)
+        
+        # 计算ranking损失
+        ranking_loss_value = self.ranking_loss(hazards, S, Y, c)
+        
+        # 组合
+        total_loss = main_loss_value + self.ranking_weight * ranking_loss_value
+        
+        return total_loss
+    
+    def get_loss_components(
+        self,
+        hazards: torch.Tensor,
+        S: torch.Tensor,
+        Y: torch.Tensor,
+        c: torch.Tensor,
+        **kwargs
+    ) -> dict:
+        """返回各个损失分量(用于监控)"""
+        with torch.no_grad():
+            main_loss_value = self.main_loss(hazards, S, Y, c, **kwargs)
+            ranking_loss_value = self.ranking_loss(hazards, S, Y, c)
+        
+        # 🔥 修复: 确保返回float而不是tensor
+        if isinstance(main_loss_value, torch.Tensor):
+            main_loss_value = main_loss_value.item()
+        if isinstance(ranking_loss_value, torch.Tensor):
+            ranking_loss_value = ranking_loss_value.item()
+        
+        return {
+            'main_loss': main_loss_value,
+            'ranking_loss': ranking_loss_value,
+            'total_loss': main_loss_value + self.ranking_weight * ranking_loss_value
+        }
 
 # ===================== 损失函数工厂 =====================
 class SurvivalLossFactory:
-    """
-    生存分析损失函数工厂
+    """生存分析损失函数工厂"""
     
-    Example:
-        >>> factory = SurvivalLossFactory()
-        >>> criterion = factory.get_loss('nll', alpha=0.15)
-        >>> loss = criterion(hazards, S, Y, c)
-    """
-    
-    AVAILABLE_LOSSES = ['nll', 'cox', 'ranking']
+    AVAILABLE_LOSSES = ['nll', 'cox', 'ranking', 'combined']  # 添加 'combined'
     
     @staticmethod
     def get_loss(
         loss_type: str = 'nll',
         **kwargs
     ) -> nn.Module:
-        """
-        获取指定类型的损失函数
-        
-        Args:
-            loss_type: str, 损失函数类型
-                - 'nll': NLLSurvLoss
-                - 'cox': CoxSurvLoss
-                - 'ranking': RankingLoss
-            **kwargs: 传递给损失函数的参数
-            
-        Returns:
-            criterion: nn.Module 损失函数实例
-            
-        Raises:
-            ValueError: 如果loss_type不在支持列表中
-        """
         loss_type = loss_type.lower()
         
         if loss_type == 'nll':
@@ -277,16 +328,24 @@ class SurvivalLossFactory:
             margin = kwargs.get('margin', 0.0)
             return RankingLoss(margin=margin)
         
+        elif loss_type == 'combined':
+            # 组合损失
+            main_loss_type = kwargs.get('main_loss_type', 'nll')
+            alpha = kwargs.get('alpha', 0.0)
+            ranking_weight = kwargs.get('ranking_weight', 0.1)
+            ranking_margin = kwargs.get('ranking_margin', 0.0)
+            return CombinedSurvLoss(
+                main_loss_type=main_loss_type,
+                alpha=alpha,
+                ranking_weight=ranking_weight,
+                ranking_margin=ranking_margin
+            )
+        
         else:
             raise ValueError(
                 f"Unknown loss type: {loss_type}. "
                 f"Available losses: {SurvivalLossFactory.AVAILABLE_LOSSES}"
             )
-    
-    @staticmethod
-    def list_available_losses():
-        """列出所有可用的损失函数"""
-        return SurvivalLossFactory.AVAILABLE_LOSSES
 
 
 # ===================== 便捷函数 =====================

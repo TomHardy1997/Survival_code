@@ -34,13 +34,13 @@ class Mamba2MIL(nn.Module):
         use_clinical: 是否使用临床特征(性别、年龄)
     """
     def __init__(self, 
-                 in_dim=512, 
-                 n_classes=4, 
-                 dropout=0.25, 
-                 act='relu', 
-                 survival=False, 
-                 layer=2,
-                 use_clinical=False):
+                in_dim=512, 
+                n_classes=4, 
+                dropout=0.25, 
+                act='relu', 
+                survival=False, 
+                layer=2,
+                use_clinical=False):
         super(Mamba2MIL, self).__init__()
         
         self.survival = survival
