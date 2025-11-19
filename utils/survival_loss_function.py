@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Dict
 
 
 class CoxSurvLoss(nn.Module):
@@ -213,7 +213,7 @@ class RankingLoss(nn.Module):
         risk_scores = hazards.sum(dim=1)  # [batch]
         
         # 构建成对比较
-        loss = 0.0
+        loss = torch.tensor(0.0, device=hazards.device, dtype=hazards.dtype)  # 🔥 修复: 初始化为tensor
         count = 0
         
         for i in range(batch_size):
@@ -228,6 +228,8 @@ class RankingLoss(nn.Module):
             loss = loss / count
         
         return loss
+
+
 class CombinedSurvLoss(nn.Module):
     """
     组合生存损失 = 主损失(NLL/Cox) + λ * Ranking Loss
@@ -286,35 +288,46 @@ class CombinedSurvLoss(nn.Module):
         Y: torch.Tensor,
         c: torch.Tensor,
         **kwargs
-    ) -> dict:
-        """返回各个损失分量(用于监控)"""
-        with torch.no_grad():
-            main_loss_value = self.main_loss(hazards, S, Y, c, **kwargs)
-            ranking_loss_value = self.ranking_loss(hazards, S, Y, c)
+    ) -> Dict[str, float]:
+        """
+        返回各个损失分量(用于监控)
         
-        # 🔥 修复: 确保返回float而不是tensor
-        if isinstance(main_loss_value, torch.Tensor):
-            main_loss_value = main_loss_value.item()
-        if isinstance(ranking_loss_value, torch.Tensor):
-            ranking_loss_value = ranking_loss_value.item()
+        🔥 修复: 确保返回float类型
+        """
+        # 🔥 不使用no_grad，因为我们需要计算梯度
+        # 但可以detach后再转换为float
+        main_loss_value = self.main_loss(hazards, S, Y, c, **kwargs)
+        ranking_loss_value = self.ranking_loss(hazards, S, Y, c)
         
+        # 🔥 转换为float
         return {
-            'main_loss': main_loss_value,
-            'ranking_loss': ranking_loss_value,
-            'total_loss': main_loss_value + self.ranking_weight * ranking_loss_value
+            'main_loss': main_loss_value.detach().item(),
+            'ranking_loss': ranking_loss_value.detach().item(),
+            'total_loss': (main_loss_value + self.ranking_weight * ranking_loss_value).detach().item()
         }
+
 
 # ===================== 损失函数工厂 =====================
 class SurvivalLossFactory:
     """生存分析损失函数工厂"""
     
-    AVAILABLE_LOSSES = ['nll', 'cox', 'ranking', 'combined']  # 添加 'combined'
+    AVAILABLE_LOSSES = ['nll', 'cox', 'ranking', 'combined']
     
     @staticmethod
     def get_loss(
         loss_type: str = 'nll',
         **kwargs
     ) -> nn.Module:
+        """
+        创建损失函数
+        
+        Args:
+            loss_type: 损失类型 ('nll', 'cox', 'ranking', 'combined')
+            **kwargs: 损失函数参数
+            
+        Returns:
+            criterion: nn.Module
+        """
         loss_type = loss_type.lower()
         
         if loss_type == 'nll':
@@ -346,6 +359,11 @@ class SurvivalLossFactory:
                 f"Unknown loss type: {loss_type}. "
                 f"Available losses: {SurvivalLossFactory.AVAILABLE_LOSSES}"
             )
+    
+    @staticmethod
+    def list_available_losses():
+        """列出所有可用的损失函数"""
+        return SurvivalLossFactory.AVAILABLE_LOSSES
 
 
 # ===================== 便捷函数 =====================
@@ -354,21 +372,32 @@ def create_survival_loss(loss_type: str = 'nll', **kwargs) -> nn.Module:
     创建生存分析损失函数的便捷函数
     
     Args:
-        loss_type: str, 损失函数类型 ('nll', 'cox', 'ranking')
+        loss_type: str, 损失函数类型 ('nll', 'cox', 'ranking', 'combined')
         **kwargs: 损失函数参数
         
     Returns:
         criterion: nn.Module
         
     Example:
+        >>> # NLL损失
         >>> criterion = create_survival_loss('nll', alpha=0.15)
+        >>> loss = criterion(hazards, S, Y, c)
+        
+        >>> # 组合损失
+        >>> criterion = create_survival_loss(
+        ...     'combined',
+        ...     main_loss_type='nll',
+        ...     alpha=0.15,
+        ...     ranking_weight=0.1,
+        ...     ranking_margin=0.0
+        ... )
         >>> loss = criterion(hazards, S, Y, c)
     """
     return SurvivalLossFactory.get_loss(loss_type, **kwargs)
 
 
+# ===================== 测试代码 =====================
 if __name__ == '__main__':
-    # 测试代码
     print("=" * 60)
     print("测试生存分析损失函数")
     print("=" * 60)
@@ -377,6 +406,7 @@ if __name__ == '__main__':
     batch_size = 8
     n_classes = 4
     
+    torch.manual_seed(42)
     hazards = torch.rand(batch_size, n_classes)
     hazards = F.softmax(hazards, dim=1)  # 归一化
     S = torch.cumprod(1 - hazards, dim=1)  # 计算生存函数
@@ -386,8 +416,8 @@ if __name__ == '__main__':
     print(f"\n输入数据:")
     print(f"  hazards shape: {hazards.shape}")
     print(f"  S shape: {S.shape}")
-    print(f"  Y: {Y}")
-    print(f"  c (censoring): {c}")
+    print(f"  Y: {Y.tolist()}")
+    print(f"  c (censoring): {c.tolist()}")
     
     # 测试 NLL Loss
     print("\n" + "-" * 60)
@@ -396,6 +426,8 @@ if __name__ == '__main__':
     nll_criterion = create_survival_loss('nll', alpha=0.15)
     nll_loss = nll_criterion(hazards, S, Y, c)
     print(f"NLL Loss: {nll_loss.item():.4f}")
+    print(f"  Type: {type(nll_loss)}")
+    print(f"  Requires grad: {nll_loss.requires_grad}")
     
     # 测试 Cox Loss
     print("\n" + "-" * 60)
@@ -404,6 +436,8 @@ if __name__ == '__main__':
     cox_criterion = create_survival_loss('cox')
     cox_loss = cox_criterion(hazards, S, Y, c)
     print(f"Cox Loss: {cox_loss.item():.4f}")
+    print(f"  Type: {type(cox_loss)}")
+    print(f"  Requires grad: {cox_loss.requires_grad}")
     
     # 测试 Ranking Loss
     print("\n" + "-" * 60)
@@ -412,6 +446,51 @@ if __name__ == '__main__':
     ranking_criterion = create_survival_loss('ranking', margin=0.1)
     ranking_loss = ranking_criterion(hazards, S, Y, c)
     print(f"Ranking Loss: {ranking_loss.item():.4f}")
+    print(f"  Type: {type(ranking_loss)}")
+    print(f"  Requires grad: {ranking_loss.requires_grad}")
+    
+    # 🔥 测试 Combined Loss
+    print("\n" + "-" * 60)
+    print("测试 Combined Loss")
+    print("-" * 60)
+    combined_criterion = create_survival_loss(
+        'combined',
+        main_loss_type='nll',
+        alpha=0.15,
+        ranking_weight=0.1,
+        ranking_margin=0.1
+    )
+    combined_loss = combined_criterion(hazards, S, Y, c)
+    print(f"Combined Loss: {combined_loss.item():.4f}")
+    print(f"  Type: {type(combined_loss)}")
+    print(f"  Requires grad: {combined_loss.requires_grad}")
+    
+    # 🔥 测试 get_loss_components
+    print("\n  Loss Components:")
+    components = combined_criterion.get_loss_components(hazards, S, Y, c)
+    for key, value in components.items():
+        print(f"    {key}: {value:.4f} (type: {type(value).__name__})")
+    
+    # 测试反向传播
+    print("\n" + "-" * 60)
+    print("测试反向传播")
+    print("-" * 60)
+    
+    # 创建需要梯度的hazards
+    hazards_grad = torch.rand(batch_size, n_classes, requires_grad=True)
+    hazards_grad = F.softmax(hazards_grad, dim=1)
+    S_grad = torch.cumprod(1 - hazards_grad, dim=1)
+    
+    # 计算损失
+    loss = combined_criterion(hazards_grad, S_grad, Y, c)
+    print(f"Loss: {loss.item():.4f}")
+    
+    # 反向传播
+    loss.backward()
+    print(f"✓ Backward pass successful")
+    print(f"  Gradient shape: {hazards_grad.grad.shape}")
+    print(f"  Gradient mean: {hazards_grad.grad.mean().item():.6f}")
+    print(f"  Gradient std: {hazards_grad.grad.std().item():.6f}")
     
     # 列出所有可用损失
     print("\n" + "-" * 60)
@@ -421,5 +500,5 @@ if __name__ == '__main__':
         print(f"  - {loss_name}")
     
     print("\n" + "=" * 60)
-    print("测试完成！")
+    print("测试完成！✅")
     print("=" * 60)

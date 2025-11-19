@@ -6,40 +6,41 @@ import numpy as np
 import h5py
 import ast
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+import warnings
 
 
 class PrognosisDataset(Dataset):
     """
-    生存预后数据集 - 支持患者级别分层、K-fold交叉验证、缓存等功能
-    专门用于已提取特征的H5文件
-    支持多模型特征选择和拼接
+    生存预后数据集
+    
+    🔥 新增功能:
+    1. 年龄自动标准化
+    2. 保存标准化参数用于测试集
     """
     def __init__(self, 
                  csv_path,
                  h5_base_dir,
-                 feature_models='uni_v1',  # 新增参数
+                 feature_models='uni_v1',
                  label_col='disc_label',
                  shuffle=False,
                  seed=42,
                  use_cache=True,
+                 max_cache_size=1000,
+                 normalize_age=True,  # 🔥 新增: 是否标准化年龄
+                 age_scaler=None,     # 🔥 新增: 外部提供的scaler
                  print_info=True):
         """
         Args:
-            csv_path: CSV文件路径
-            h5_base_dir: H5特征文件基础目录 (例如: .../20x_512px_0px_overlap)
-            feature_models: 特征模型名称，支持:
-                - str: 单个模型名 'uni_v1'
-                - list: 多个模型名 ['uni_v1', 'uni_v2'] (会拼接特征)
-            label_col: 标签列名
-            shuffle: 是否打乱数据
-            seed: 随机种子
-            use_cache: 是否使用缓存
-            print_info: 是否打印数据集信息
+            normalize_age: 是否标准化年龄 (默认True)
+            age_scaler: 外部提供的StandardScaler (用于测试集)
         """
         self.seed = seed
         self.use_cache = use_cache
+        self.max_cache_size = max_cache_size
         self.print_info = print_info
         self.label_col = label_col
+        self.normalize_age = normalize_age
         
         # 处理特征模型参数
         if isinstance(feature_models, str):
@@ -60,12 +61,14 @@ class PrognosisDataset(Dataset):
         
         # 数据缓存
         self.data_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
         
         # 加载CSV数据
         self.slide_data = pd.read_csv(csv_path)
         
         # 预处理数据
-        self._preprocess_data()
+        self._preprocess_data(age_scaler)
         
         # 构建患者-切片映射
         self._build_patient_mapping()
@@ -73,8 +76,11 @@ class PrognosisDataset(Dataset):
         # 准备患者级别数据
         self._prepare_patient_data()
         
-        # 准备类别索引 (用于类别平衡采样)
+        # 准备类别索引
         self._prepare_class_indices()
+        
+        # 验证特征维度
+        self._validate_feature_dims()
         
         # 初始化分割
         self.train_ids = []
@@ -85,15 +91,18 @@ class PrognosisDataset(Dataset):
             np.random.seed(seed)
             patient_indices = np.arange(self.num_patients)
             np.random.shuffle(patient_indices)
-            # 重新排列patient_data
             for key in self.patient_data:
                 self.patient_data[key] = self.patient_data[key][patient_indices]
         
         if print_info:
             self.summarize()
     
-    def _preprocess_data(self):
-        """预处理数据"""
+    def _preprocess_data(self, external_age_scaler=None):
+        """
+        预处理数据
+        
+        🔥 改进: 添加年龄标准化
+        """
         # 性别编码
         gender_map = {
             'Male': 0, 'Female': 1, 'MALE': 0, 'FEMALE': 1,
@@ -106,11 +115,43 @@ class PrognosisDataset(Dataset):
             .astype(int)
         )
         
-        # 年龄处理
+        # 🔥 年龄处理 - 改进版
         self.slide_data['age'] = pd.to_numeric(
             self.slide_data['age'], 
             errors='coerce'
-        ).fillna(-1)
+        )
+        
+        # 计算年龄均值用于填充缺失值
+        age_mean = self.slide_data['age'].mean()
+        if pd.isna(age_mean):
+            age_mean = 60.0
+            warnings.warn("All ages are missing, using default value 60.0")
+        
+        self.slide_data['age'] = self.slide_data['age'].fillna(age_mean)
+        
+        # 🔥 年龄标准化
+        if self.normalize_age:
+            if external_age_scaler is not None:
+                # 使用外部提供的scaler (用于测试集)
+                self.age_scaler = external_age_scaler
+                self.slide_data['age_normalized'] = self.age_scaler.transform(
+                    self.slide_data[['age']]
+                ).flatten()
+                print(f"✓ Using external age scaler")
+            else:
+                # 训练新的scaler
+                self.age_scaler = StandardScaler()
+                self.slide_data['age_normalized'] = self.age_scaler.fit_transform(
+                    self.slide_data[['age']]
+                ).flatten()
+                print(f"✓ Age normalized: mean={self.age_scaler.mean_[0]:.2f}, "
+                      f"std={self.age_scaler.scale_[0]:.2f}")
+            
+            # 使用标准化后的年龄
+            self.slide_data['age'] = self.slide_data['age_normalized']
+        else:
+            self.age_scaler = None
+            print("⚠ Age normalization disabled")
         
         # 解析slide_id列表
         if 'slide_id' in self.slide_data.columns:
@@ -142,8 +183,7 @@ class PrognosisDataset(Dataset):
             self.patient_to_slides[case_id] = list(set(self.patient_to_slides[case_id]))
     
     def _prepare_patient_data(self):
-        """准备患者级别的数据 (每个患者一条记录)"""
-        # 按患者分组,取第一条记录作为患者数据
+        """准备患者级别的数据"""
         patient_df = self.slide_data.groupby('case_id').first().reset_index()
         
         self.patient_data = {
@@ -152,20 +192,76 @@ class PrognosisDataset(Dataset):
             'survival_months': patient_df['survival_months'].values,
             'censorship': patient_df['censorship'].values,
             'gender': patient_df['gender_encoded'].values,
-            'age': patient_df['age'].values
+            'age': patient_df['age'].values  # 已经是标准化后的值
         }
         
         self.num_patients = len(self.patient_data['case_id'])
         self.num_classes = len(np.unique(self.patient_data['label']))
     
     def _prepare_class_indices(self):
-        """准备每个类别的患者索引 (用于类别平衡采样)"""
+        """准备每个类别的患者索引"""
         self.patient_cls_ids = [[] for _ in range(self.num_classes)]
         
         for i in range(self.num_classes):
             self.patient_cls_ids[i] = np.where(
                 self.patient_data['label'] == i
             )[0]
+    
+    def _validate_feature_dims(self):
+        """验证所有H5文件的特征维度一致性"""
+        print("\n" + "="*60)
+        print("Validating Feature Dimensions...")
+        print("="*60)
+        
+        self.feature_dims = []
+        
+        for model, h5_dir in zip(self.feature_models, self.h5_dirs):
+            h5_files = [f for f in os.listdir(h5_dir) if f.endswith('.h5')]
+            if not h5_files:
+                raise ValueError(f"No H5 files found in {h5_dir}")
+            
+            sample_file = h5_files[0]
+            sample_path = os.path.join(h5_dir, sample_file)
+            
+            try:
+                with h5py.File(sample_path, 'r') as f:
+                    feat_dim = f['features'].shape[1]
+                    self.feature_dims.append(feat_dim)
+                    print(f"  Model '{model}': feature_dim = {feat_dim}")
+            except Exception as e:
+                raise RuntimeError(f"Error reading {sample_path}: {e}")
+        
+        self.total_feature_dim = sum(self.feature_dims)
+        print(f"\nTotal concatenated feature dimension: {self.total_feature_dim}")
+        print("="*60)
+    
+    def get_class_weights(self):
+        """计算类别权重"""
+        unique, counts = np.unique(self.patient_data['label'], return_counts=True)
+        weights = 1.0 / counts
+        weights = weights / weights.sum() * len(weights)
+        return torch.FloatTensor(weights)
+    
+    def get_cache_stats(self):
+        """获取缓存统计信息"""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0
+        
+        return {
+            'cache_size': len(self.data_cache),
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate': hit_rate
+        }
+    
+    def get_age_scaler(self):
+        """
+        🔥 新增: 获取年龄标准化器 (用于测试集)
+        
+        Returns:
+            StandardScaler or None
+        """
+        return self.age_scaler
     
     def summarize(self):
         """打印数据集统计信息"""
@@ -185,10 +281,30 @@ class PrognosisDataset(Dataset):
         for cls, count in zip(unique, counts):
             print(f"  Class {cls}: {count} patients ({count/self.num_patients*100:.1f}%)")
         
+        class_weights = self.get_class_weights()
+        print("\nClass weights (for balanced loss):")
+        for cls, weight in enumerate(class_weights):
+            print(f"  Class {cls}: {weight:.4f}")
+        
         print("\nSurvival statistics:")
         print(f"  Mean survival: {np.mean(self.patient_data['survival_months']):.2f} months")
         print(f"  Median survival: {np.median(self.patient_data['survival_months']):.2f} months")
         print(f"  Censorship rate: {np.mean(self.patient_data['censorship'])*100:.1f}%")
+        
+        # 🔥 改进: 显示年龄统计
+        print("\nAge statistics:")
+        if self.normalize_age:
+            print(f"  ✓ Normalized (mean=0, std=1)")
+            print(f"  Range: [{np.min(self.patient_data['age']):.2f}, "
+                  f"{np.max(self.patient_data['age']):.2f}]")
+            if self.age_scaler is not None:
+                print(f"  Original mean: {self.age_scaler.mean_[0]:.2f}")
+                print(f"  Original std: {self.age_scaler.scale_[0]:.2f}")
+        else:
+            print(f"  Mean age: {np.mean(self.patient_data['age']):.2f}")
+            print(f"  Median age: {np.median(self.patient_data['age']):.2f}")
+            print(f"  Age range: [{np.min(self.patient_data['age']):.0f}, "
+                  f"{np.max(self.patient_data['age']):.0f}]")
         
         print("\nSlides per patient:")
         slides_per_patient = [len(slides) for slides in self.patient_to_slides.values()]
@@ -198,15 +314,7 @@ class PrognosisDataset(Dataset):
         print("=" * 60)
     
     def create_splits(self, n_splits=5, val_ratio=0.15, test_ratio=0.15, stratify=True):
-        """
-        创建K-fold交叉验证分割 (患者级别)
-        
-        Args:
-            n_splits: fold数量
-            val_ratio: 验证集比例
-            test_ratio: 测试集比例
-            stratify: 是否按类别分层
-        """
+        """创建K-fold交叉验证分割"""
         self.n_splits = n_splits
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
@@ -215,7 +323,6 @@ class PrognosisDataset(Dataset):
         labels = self.patient_data['label']
         
         if stratify:
-            # 分层K-fold
             skf = StratifiedKFold(
                 n_splits=n_splits,
                 shuffle=True,
@@ -223,7 +330,6 @@ class PrognosisDataset(Dataset):
             )
             self.splits = list(skf.split(np.zeros(n_patients), labels))
         else:
-            # 普通K-fold
             from sklearn.model_selection import KFold
             kf = KFold(
                 n_splits=n_splits,
@@ -238,12 +344,7 @@ class PrognosisDataset(Dataset):
         print(f"  Stratified: {stratify}")
     
     def set_split(self, fold=0):
-        """
-        设置当前使用的fold
-        
-        Args:
-            fold: fold索引 (0 to n_splits-1)
-        """
+        """设置当前使用的fold"""
         if not hasattr(self, 'splits'):
             raise ValueError("Please call create_splits() first!")
         
@@ -252,7 +353,6 @@ class PrognosisDataset(Dataset):
         
         train_val_idx, test_idx = self.splits[fold]
         
-        # 从train_val中分出验证集
         n_val = int(len(train_val_idx) * self.val_ratio / (1 - self.test_ratio))
         
         np.random.seed(self.seed + fold)
@@ -270,27 +370,17 @@ class PrognosisDataset(Dataset):
         print(f"  Val: {len(val_idx)} patients")
         print(f"  Test: {len(test_idx)} patients")
         
-        # 打印每个split的类别分布
         for split_name, split_ids in [('Train', train_idx), ('Val', val_idx), ('Test', test_idx)]:
             split_labels = self.patient_data['label'][split_ids]
             unique, counts = np.unique(split_labels, return_counts=True)
             print(f"  {split_name} class distribution: {dict(zip(unique, counts))}")
         
-        # 验证没有重叠
         assert len(np.intersect1d(train_idx, val_idx)) == 0
         assert len(np.intersect1d(train_idx, test_idx)) == 0
         assert len(np.intersect1d(val_idx, test_idx)) == 0
     
     def get_split_dataset(self, split='train'):
-        """
-        获取指定split的数据集
-        
-        Args:
-            split: 'train', 'val', 或 'test'
-        
-        Returns:
-            PrognosisSplit对象
-        """
+        """获取指定split的数据集"""
         if split == 'train':
             patient_ids = self.train_ids
         elif split == 'val':
@@ -307,24 +397,14 @@ class PrognosisDataset(Dataset):
         )
     
     def get_patient_samples(self, class_id, n_samples, replace=False):
-        """
-        从指定类别中采样患者 (用于类别平衡)
-        
-        Args:
-            class_id: 类别ID
-            n_samples: 采样数量
-            replace: 是否有放回采样
-        
-        Returns:
-            患者索引数组
-        """
+        """从指定类别中采样患者"""
         if class_id >= self.num_classes:
             raise ValueError(f"class_id must be < {self.num_classes}")
         
         available_ids = self.patient_cls_ids[class_id]
         
         if n_samples > len(available_ids) and not replace:
-            print(f"Warning: Requested {n_samples} samples but only {len(available_ids)} available")
+            warnings.warn(f"Requested {n_samples} samples but only {len(available_ids)} available")
             n_samples = len(available_ids)
         
         indices = np.random.choice(
@@ -339,25 +419,18 @@ class PrognosisDataset(Dataset):
         """
         加载外部测试集
         
-        Args:
-            csv_path: 外部测试集CSV路径
-            h5_base_dir: 外部测试集H5基础目录 (如果为None则使用当前数据集的)
-            feature_models: 特征模型名称 (如果为None则使用当前数据集的)
-        
-        Returns:
-            external_test_dataset: PrognosisSplit对象
+        🔥 改进: 自动传递age_scaler
         """
         print("\n" + "="*60)
         print("Loading External Test Set")
         print("="*60)
         
-        # 使用当前数据集的配置
         if h5_base_dir is None:
             h5_base_dir = self.h5_base_dir
         if feature_models is None:
             feature_models = self.feature_models
         
-        # 创建一个新的数据集实例
+        # 🔥 关键: 传递age_scaler到外部测试集
         external_dataset = PrognosisDataset(
             csv_path=csv_path,
             h5_base_dir=h5_base_dir,
@@ -366,13 +439,14 @@ class PrognosisDataset(Dataset):
             shuffle=False,
             seed=self.seed,
             use_cache=self.use_cache,
+            max_cache_size=self.max_cache_size,
+            normalize_age=self.normalize_age,
+            age_scaler=self.age_scaler,  # 🔥 使用训练集的scaler
             print_info=True
         )
         
-        # 获取所有患者索引
         all_indices = np.arange(external_dataset.num_patients)
         
-        # 创建一个 PrognosisSplit 对象
         external_test = PrognosisSplit(
             parent_dataset=external_dataset,
             patient_indices=all_indices,
@@ -400,7 +474,6 @@ class PrognosisDataset(Dataset):
         """从文件加载数据分割"""
         df = pd.read_csv(filename)
         
-        # 将case_id转换为索引
         case_id_to_idx = {
             case_id: idx 
             for idx, case_id in enumerate(self.patient_data['case_id'])
@@ -428,21 +501,13 @@ class PrognosisDataset(Dataset):
         print(f"  Test: {len(self.test_ids)} patients")
     
     def _load_features_from_h5(self, h5_path):
-        """
-        从单个H5文件加载特征
-        
-        Args:
-            h5_path: H5文件路径
-            
-        Returns:
-            features: torch.Tensor [num_patches, feature_dim]
-            coords: torch.Tensor [num_patches, 2]
-        """
-        # 检查缓存
+        """从单个H5文件加载特征"""
         if self.use_cache and h5_path in self.data_cache:
+            self._cache_hits += 1
             return self.data_cache[h5_path]
         
-        # 加载H5文件
+        self._cache_misses += 1
+        
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f'File not found: {h5_path}')
         
@@ -457,8 +522,11 @@ class PrognosisDataset(Dataset):
                 features = torch.tensor(features, dtype=torch.float32)
                 coords = torch.tensor(coords, dtype=torch.float32)
                 
-                # 缓存
                 if self.use_cache:
+                    if len(self.data_cache) >= self.max_cache_size:
+                        first_key = next(iter(self.data_cache))
+                        del self.data_cache[first_key]
+                    
                     self.data_cache[h5_path] = (features, coords)
                 
                 return features, coords
@@ -471,45 +539,25 @@ class PrognosisDataset(Dataset):
         return self.num_patients
     
     def __getitem__(self, patient_idx):
-        """
-        获取一个患者的数据
-        
-        Returns:
-            dict: {
-                'case_id': 患者ID,
-                'gender': 性别,
-                'age': 年龄,
-                'label': 标签,
-                'survival_time': 生存时间,
-                'censorship': 删失状态,
-                'features': 特征张量,
-                'coords': 坐标张量,
-                'num_patches': patch数量
-            }
-        """
-        # 获取患者信息
+        """获取一个患者的数据"""
         case_id = self.patient_data['case_id'][patient_idx]
         gender = int(self.patient_data['gender'][patient_idx])
-        age = float(self.patient_data['age'][patient_idx])
+        age = float(self.patient_data['age'][patient_idx])  # 已经是标准化后的值
         label = int(self.patient_data['label'][patient_idx])
         survival_time = float(self.patient_data['survival_months'][patient_idx])
         censorship = int(self.patient_data['censorship'][patient_idx])
         
-        # 获取该患者的所有切片
         slide_ids = self.patient_to_slides.get(case_id, [])
         
         if not slide_ids:
             raise ValueError(f"No slides found for patient {case_id}")
         
-        # 加载并拼接所有切片的特征
-        all_slide_features = []  # 存储所有切片的特征
-        all_slide_coords = []    # 存储所有切片的坐标
+        all_slide_features = []
+        all_slide_coords = []
         
         for slide_id in slide_ids:
-            # 构建H5文件ID
             h5_id = slide_id.strip().replace('.pt', '.h5')
             
-            # 从所有模型加载特征并拼接
             slide_features_list = []
             slide_coords = None
             
@@ -520,21 +568,26 @@ class PrognosisDataset(Dataset):
                     features, coords = self._load_features_from_h5(h5_path)
                     slide_features_list.append(features)
                     
-                    # 坐标只需要保存一次(所有模型的坐标应该相同)
                     if slide_coords is None:
                         slide_coords = coords
                     
                 except Exception as e:
-                    print(f'Warning: Error loading {h5_path}: {e}')
+                    warnings.warn(f'Error loading {h5_path}: {e}')
                     continue
             
             if not slide_features_list:
-                print(f'Warning: No valid features loaded for slide {slide_id}')
+                warnings.warn(f'No valid features loaded for slide {slide_id}')
                 continue
             
-            # 拼接多个模型的特征 (在特征维度上拼接)
             if len(slide_features_list) > 1:
-                slide_features = torch.cat(slide_features_list, dim=1)  # [num_patches, sum(feature_dims)]
+                patch_counts = [f.shape[0] for f in slide_features_list]
+                if len(set(patch_counts)) > 1:
+                    raise ValueError(
+                        f"Patch count mismatch for slide {slide_id}: {patch_counts}"
+                    )
+            
+            if len(slide_features_list) > 1:
+                slide_features = torch.cat(slide_features_list, dim=1)
             else:
                 slide_features = slide_features_list[0]
             
@@ -544,15 +597,14 @@ class PrognosisDataset(Dataset):
         if not all_slide_features:
             raise ValueError(f"No valid features loaded for patient {case_id}")
         
-        # 拼接所有切片 (在patch维度上拼接)
-        features = torch.cat(all_slide_features, dim=0)  # [total_patches, feature_dim]
-        coords = torch.cat(all_slide_coords, dim=0)      # [total_patches, 2]
+        features = torch.cat(all_slide_features, dim=0)
+        coords = torch.cat(all_slide_coords, dim=0)
         num_patches = features.shape[0]
         
         return {
             'case_id': case_id,
             'gender': gender,
-            'age': age,
+            'age': age,  # 标准化后的年龄
             'label': label,
             'survival_time': survival_time,
             'censorship': censorship,
@@ -563,9 +615,7 @@ class PrognosisDataset(Dataset):
 
 
 class PrognosisSplit(Dataset):
-    """
-    数据集的一个split (train/val/test)
-    """
+    """数据集的一个split"""
     def __init__(self, parent_dataset, patient_indices, split_name='train'):
         self.parent = parent_dataset
         self.patient_indices = patient_indices
@@ -573,7 +623,6 @@ class PrognosisSplit(Dataset):
         self.use_cache = parent_dataset.use_cache
         self.h5_dirs = parent_dataset.h5_dirs
         
-        # 准备该split的类别索引
         self._prepare_class_indices()
     
     def _prepare_class_indices(self):
@@ -593,11 +642,6 @@ class PrognosisSplit(Dataset):
         return len(self.patient_indices)
     
     def __getitem__(self, local_idx):
-        """
-        Args:
-            local_idx: 在该split中的索引
-        """
-        # 转换为全局索引
         global_idx = self.patient_indices[local_idx]
         return self.parent[global_idx]
     
@@ -614,34 +658,12 @@ class PrognosisSplit(Dataset):
         return np.random.choice(available_ids, size=n_samples, replace=replace)
 
 
-# ============= 自定义Collate函数 =============
 def custom_collate_fn(batch):
-    """
-    自定义collate函数,用于处理变长的patch序列
-    
-    Args:
-        batch: list of dict, 每个dict包含:
-            - case_id: 患者ID
-            - gender: 性别
-            - age: 年龄
-            - label: 标签
-            - survival_time: 生存时间
-            - censorship: 删失状态
-            - features: [num_patches, feature_dim]
-            - coords: [num_patches, 2]
-            - num_patches: patch数量
-    
-    Returns:
-        tuple: (patient_list, gender_tensor, age_tensor, label_tensor, 
-                sur_time_tensor, censor_tensor, path_features, coords_tensor, 
-                num_patch_tensor, mask_tensor)
-    """
-    # 过滤掉None
+    """自定义collate函数"""
     batch = [item for item in batch if item is not None]
     if not batch:
         return None
     
-    # 提取数据
     patient_list = [item['case_id'] for item in batch]
     gender_list = [item['gender'] for item in batch]
     age_list = [item['age'] for item in batch]
@@ -649,7 +671,6 @@ def custom_collate_fn(batch):
     sur_time_list = [item['survival_time'] for item in batch]
     censor_list = [item['censorship'] for item in batch]
     
-    # 找到最大patch数
     max_patch_count = max(item['num_patches'] for item in batch)
     
     path_features_list = []
@@ -658,11 +679,10 @@ def custom_collate_fn(batch):
     num_patch_list = []
     
     for item in batch:
-        features = item['features']  # [num_patches, feature_dim]
-        coords = item['coords']      # [num_patches, 2]
+        features = item['features']
+        coords = item['coords']
         num_patches = item['num_patches']
         
-        # Padding features
         if features.size(0) < max_patch_count:
             padding = torch.zeros(
                 max_patch_count - features.size(0), 
@@ -671,7 +691,6 @@ def custom_collate_fn(batch):
             )
             features = torch.cat((features, padding), dim=0)
         
-        # Padding coords
         if coords.size(0) < max_patch_count:
             coords_padding = torch.zeros(
                 max_patch_count - coords.size(0), 
@@ -680,7 +699,6 @@ def custom_collate_fn(batch):
             )
             coords = torch.cat((coords, coords_padding), dim=0)
         
-        # 创建mask (1表示真实patch, 0表示padding)
         mask = torch.ones(max_patch_count, dtype=torch.float)
         mask[num_patches:] = 0
         
@@ -689,51 +707,61 @@ def custom_collate_fn(batch):
         mask_list.append(mask)
         num_patch_list.append(num_patches)
     
-    # 转换为tensor
     gender_tensor = torch.tensor(gender_list, dtype=torch.long)
     age_tensor = torch.tensor(age_list, dtype=torch.float)
     label_tensor = torch.tensor(label_list, dtype=torch.long)
     sur_time_tensor = torch.tensor(sur_time_list, dtype=torch.float)
     censor_tensor = torch.tensor(censor_list, dtype=torch.float)
     
-    # Stack成batch
-    path_features = torch.stack(path_features_list, dim=0)  # [batch, max_patches, feat_dim]
-    coords_tensor = torch.stack(coords_list, dim=0)         # [batch, max_patches, 2]
-    mask_tensor = torch.stack(mask_list, dim=0)             # [batch, max_patches]
-    num_patch_tensor = torch.tensor(num_patch_list, dtype=torch.long)  # [batch]
+    path_features = torch.stack(path_features_list, dim=0)
+    coords_tensor = torch.stack(coords_list, dim=0)
+    mask_tensor = torch.stack(mask_list, dim=0)
+    num_patch_tensor = torch.tensor(num_patch_list, dtype=torch.long)
     
-    return (
-        patient_list,      # list of str
-        gender_tensor,     # [batch]
-        age_tensor,        # [batch]
-        label_tensor,      # [batch]
-        sur_time_tensor,   # [batch]
-        censor_tensor,     # [batch]
-        path_features,     # [batch, max_patches, feat_dim]
-        coords_tensor,     # [batch, max_patches, 2]
-        num_patch_tensor,  # [batch]
-        mask_tensor        # [batch, max_patches]
-    )
+    return {
+        'case_id': patient_list,
+        'gender': gender_tensor,
+        'age': age_tensor,
+        'label': label_tensor,
+        'survival_time': sur_time_tensor,
+        'censorship': censor_tensor,
+        'features': path_features,
+        'coords': coords_tensor,
+        'num_patches': num_patch_tensor,
+        'mask': mask_tensor
+    }
 
 
 if __name__ == '__main__':
-    # 1. 使用单个模型
-    dataset = PrognosisDataset(
-        csv_path='data.csv',
+    print("="*60)
+    print("Testing PrognosisDataset with Age Normalization")
+    print("="*60)
+    
+    # 🔥 测试1: 标准化年龄
+    print("\n[Test 1] With age normalization")
+    dataset1 = PrognosisDataset(
+        csv_path='/home/stat-jijianxin/PFMs/Survival_code/csv_file/tcga_survival_matched.csv',
         h5_base_dir='/home/stat-jijianxin/PFMs/TRIDENT/tcga_filtered/20x_512px_0px_overlap',
-        feature_models='uni_v1'  # 单个模型
+        feature_models='uni_v1',
+        normalize_age=True  # 开启标准化
     )
-
-    # 2. 使用多个模型拼接特征
-    dataset = PrognosisDataset(
-        csv_path='data.csv',
+    
+    # 🔥 测试2: 不标准化年龄
+    print("\n[Test 2] Without age normalization")
+    dataset2 = PrognosisDataset(
+        csv_path='/home/stat-jijianxin/PFMs/Survival_code/csv_file/tcga_survival_matched.csv',
         h5_base_dir='/home/stat-jijianxin/PFMs/TRIDENT/tcga_filtered/20x_512px_0px_overlap',
-        feature_models=['uni_v1', 'uni_v2']  # 多个模型,特征会在维度上拼接
+        feature_models='uni_v1',
+        normalize_age=False  # 关闭标准化
     )
-
-    # 3. 使用三个模型
-    dataset = PrognosisDataset(
-        csv_path='data.csv',
-        h5_base_dir='/home/stat-jijianxin/PFMs/TRIDENT/tcga_filtered/20x_512px_0px_overlap',
-        feature_models=['uni_v1', 'conch_v1', 'virchow2']
+    
+    # 🔥 测试3: 外部测试集使用训练集的scaler
+    print("\n[Test 3] External test with training scaler")
+    external_test = dataset1.load_external_test(
+        csv_path='/home/stat-jijianxin/PFMs/Survival_code/csv_file/hmu_survival_with_slides.csv'
     )
+    
+    print("\n" + "="*60)
+    print("All tests completed!")
+    print("="*60)
+    import ipdb;ipdb.set_trace()
